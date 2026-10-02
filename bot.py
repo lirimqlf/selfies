@@ -13,6 +13,7 @@ from cryptography.fernet import Fernet, MultiFernet, InvalidToken
 DATA_DIR = Path(os.getenv("DATA_DIR", "."))
 DATA_FILE = DATA_DIR / "data.enc"              # avertissements (chiffré)
 CONFIG_FILE = DATA_DIR / "guild_config.enc"    # config des serveurs (chiffré)
+DATABASE_URL = os.getenv("DATABASE_URL")       # Postgres externe (ex. Neon) → stockage persistant
 RETENTION_JOURS = 90                           # purge auto après inactivité
 MAX_AVERT = 3
 PRIVACY_URL = os.getenv("PRIVACY_URL", "https://VOTRE-PSEUDO.github.io/selfies/privacy.html")
@@ -33,9 +34,33 @@ def init_crypto():
         raise ValueError("❌ Variable d'environnement DATA_ENCRYPTION_KEY manquante.")
     _fernet = MultiFernet(keys)
 
+_db_pret = False
+
+def _db():
+    """Connexion Postgres (nouvelle à chaque appel : Neon met les connexions en veille)."""
+    global _db_pret
+    import psycopg2
+    conn = psycopg2.connect(DATABASE_URL, connect_timeout=10)
+    if not _db_pret:
+        with conn, conn.cursor() as cur:
+            cur.execute("CREATE TABLE IF NOT EXISTS blobs (name TEXT PRIMARY KEY, content BYTEA NOT NULL)")
+        _db_pret = True
+    return conn
+
 def _ecrire_chiffre(path: Path, obj):
-    path.parent.mkdir(parents=True, exist_ok=True)
     blob = _fernet.encrypt(json.dumps(obj, ensure_ascii=False).encode("utf-8"))
+    if DATABASE_URL:  # le blob est déjà chiffré (Fernet) avant d'être envoyé
+        conn = _db()
+        try:
+            with conn, conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO blobs (name, content) VALUES (%s, %s) "
+                    "ON CONFLICT (name) DO UPDATE SET content = EXCLUDED.content",
+                    (path.name, blob))
+        finally:
+            conn.close()
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "wb") as f:
@@ -43,12 +68,25 @@ def _ecrire_chiffre(path: Path, obj):
     os.replace(tmp, path)  # écriture atomique
 
 def _lire_chiffre(path: Path):
-    if not path.exists():
-        return {}
+    if DATABASE_URL:
+        conn = _db()
+        try:
+            with conn, conn.cursor() as cur:
+                cur.execute("SELECT content FROM blobs WHERE name = %s", (path.name,))
+                row = cur.fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return {}
+        raw = bytes(row[0])
+    else:
+        if not path.exists():
+            return {}
+        raw = path.read_bytes()
     try:
-        return json.loads(_fernet.decrypt(path.read_bytes()))
+        return json.loads(_fernet.decrypt(raw))
     except InvalidToken:
-        raise RuntimeError(f"Impossible de déchiffrer {path} : mauvaise DATA_ENCRYPTION_KEY ?")
+        raise RuntimeError(f"Impossible de déchiffrer {path.name} : mauvaise DATA_ENCRYPTION_KEY ?")
 
 def maintenant() -> str:
     return datetime.now(timezone.utc).isoformat()
