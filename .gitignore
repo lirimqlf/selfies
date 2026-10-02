@@ -1,0 +1,9 @@
+.env
+data.json
+guild_config.json
+*.enc
+*.tmp
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
